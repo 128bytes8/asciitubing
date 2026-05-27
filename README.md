@@ -2,6 +2,8 @@
 
 A minimal Rust + OpenCV tool that streams your webcam directly into the terminal as full-screen colored ASCII art.
 
+[![asciitubing demo](https://img.youtube.com/vi/i__ff5CbVk4/0.jpg)](https://www.youtube.com/watch?v=i__ff5CbVk4)
+
 ```
         .'`^":;Il!i><~+_-?][}{1)(|\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$
        .'`^":;Il!i><~+_-?][}{1)(|\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$
