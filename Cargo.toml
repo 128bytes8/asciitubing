@@ -1,0 +1,8 @@
+[package]
+name = "asciitubing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+opencv = { version = "0.98", features = ["videoio", "imgproc"] }
+crossterm = "0.29"
