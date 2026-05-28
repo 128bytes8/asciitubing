@@ -1,96 +1,131 @@
+mod color;
+mod ramp;
+
+use color::{color_at, ColorCtx, ColorMode, LUM_THRESHOLD};
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode},
-    style::{Color, Print, ResetColor, SetForegroundColor},
+    style::{Color as TermColor, Print, ResetColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
     QueueableCommand,
 };
+use opencv::core::{Rect, Size};
 use opencv::imgproc;
+use opencv::objdetect::{CascadeClassifier, CascadeClassifierTrait};
 use opencv::prelude::*;
 use opencv::videoio::{VideoCapture, VideoCaptureTrait, CAP_V4L2};
+use ramp::{compute_edges, edge_strength, char_for, RampMode};
+use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const ASCII_RAMP: &[u8] = b" .'`^\":;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
-
-#[derive(Clone, Copy)]
-enum ColorMode {
-    Green,
-    Red,
-    Blue,
-    Yellow,
-    Orange,
-    Purple,
-    Cyan,
-    White,
-    Rainbow,
+struct FrameCache {
+    bgr: Mat,
+    gray: Mat,
+    edges: Option<Mat>,
 }
 
-impl ColorMode {
-    fn next(self) -> Self {
-        match self {
-            ColorMode::Green => ColorMode::Red,
-            ColorMode::Red => ColorMode::Blue,
-            ColorMode::Blue => ColorMode::Yellow,
-            ColorMode::Yellow => ColorMode::Orange,
-            ColorMode::Orange => ColorMode::Purple,
-            ColorMode::Purple => ColorMode::Cyan,
-            ColorMode::Cyan => ColorMode::White,
-            ColorMode::White => ColorMode::Rainbow,
-            ColorMode::Rainbow => ColorMode::Green,
+struct FaceDetector {
+    cascade: Option<CascadeClassifier>,
+    rect: Option<Rect>,
+}
+
+impl FaceDetector {
+    fn new() -> Self {
+        let path = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml";
+        let cascade = CascadeClassifier::new(path)
+            .or_else(|_| CascadeClassifier::new("/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml"))
+            .ok();
+        Self {
+            cascade,
+            rect: None,
         }
     }
 
-    fn name(self) -> &'static str {
-        match self {
-            ColorMode::Green => "green",
-            ColorMode::Red => "red",
-            ColorMode::Blue => "blue",
-            ColorMode::Yellow => "yellow",
-            ColorMode::Orange => "orange",
-            ColorMode::Purple => "purple",
-            ColorMode::Cyan => "cyan",
-            ColorMode::White => "white",
-            ColorMode::Rainbow => "rainbow",
+    fn update(&mut self, gray: &Mat) {
+        let Some(ref mut cascade) = self.cascade else {
+            self.rect = None;
+            return;
+        };
+        let mut faces = opencv::core::Vector::<Rect>::new();
+        if cascade
+            .detect_multi_scale(gray, &mut faces, 1.2, 3, 0, Size::new(60, 60), Size::new(0, 0))
+            .is_ok()
+            && !faces.is_empty()
+        {
+            self.rect = faces.get(0).ok();
+        } else {
+            self.rect = None;
         }
     }
 
-    fn to_crossterm(self, x: u16, y: u16, t: f32) -> Color {
-        match self {
-            ColorMode::Green => Color::Rgb { r: 50, g: 255, b: 50 },
-            ColorMode::Red => Color::Rgb { r: 255, g: 50, b: 50 },
-            ColorMode::Blue => Color::Rgb { r: 50, g: 100, b: 255 },
-            ColorMode::Yellow => Color::Rgb { r: 255, g: 235, b: 50 },
-            ColorMode::Orange => Color::Rgb { r: 255, g: 140, b: 20 },
-            ColorMode::Purple => Color::Rgb { r: 180, g: 50, b: 255 },
-            ColorMode::Cyan => Color::Rgb { r: 50, g: 240, b: 255 },
-            ColorMode::White => Color::Rgb { r: 230, g: 230, b: 230 },
-            ColorMode::Rainbow => {
-                let hue = ((x as f32 * 4.0 + y as f32 * 2.0) / 60.0 + t).rem_euclid(1.0);
-                hsv_to_rgb(hue, 0.9, 1.0)
+    fn contains(&self, x: i32, y: i32) -> bool {
+        let Some(r) = self.rect else {
+            return false;
+        };
+        x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    }
+}
+
+struct GlitchState {
+    columns: Vec<u16>,
+    frames_left: u8,
+}
+
+impl GlitchState {
+    fn tick(&mut self, cols: u16) {
+        if self.frames_left > 0 {
+            self.frames_left -= 1;
+            return;
+        }
+        if fastrand::u8(..) < 20 {
+            self.columns.clear();
+            let n = fastrand::usize(1..=8);
+            for _ in 0..n {
+                self.columns.push(fastrand::u16(..cols));
             }
+            self.frames_left = 2;
         }
+    }
+
+    fn hit(&self, x: u16) -> bool {
+        self.frames_left > 0 && self.columns.contains(&x)
     }
 }
 
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Color {
-    let i = (h * 6.0).floor() as i32;
-    let f = h * 6.0 - i as f32;
-    let p = v * (1.0 - s);
-    let q = v * (1.0 - f * s);
-    let t = v * (1.0 - (1.0 - f) * s);
-    let (r, g, b) = match i % 6 {
-        0 => (v, t, p),
-        1 => (q, v, p),
-        2 => (p, v, t),
-        3 => (p, q, v),
-        4 => (t, p, v),
-        _ => (v, p, q),
-    };
-    Color::Rgb {
-        r: (r * 255.0) as u8,
-        g: (g * 255.0) as u8,
-        b: (b * 255.0) as u8,
+struct FrameStats {
+    dark: u32,
+    light: u32,
+    lum_sum: f64,
+    total: u32,
+}
+
+impl FrameStats {
+    fn new() -> Self {
+        Self {
+            dark: 0,
+            light: 0,
+            lum_sum: 0.0,
+            total: 0,
+        }
+    }
+
+    fn record(&mut self, lum: f32) {
+        self.total += 1;
+        self.lum_sum += lum as f64;
+        if lum < LUM_THRESHOLD {
+            self.dark += 1;
+        } else {
+            self.light += 1;
+        }
+    }
+
+    fn avg_lum(&self) -> f32 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.lum_sum / self.total as f64) as f32
+        }
     }
 }
 
@@ -109,7 +144,18 @@ fn main() -> io::Result<()> {
     stdout.flush()?;
 
     let mut color_mode = ColorMode::Green;
-    let mut rainbow_t = 0.0f32;
+    let mut ramp_mode = RampMode::Normal;
+    let mut mirror = false;
+    let mut invert_lum = false;
+    let mut paused = false;
+    let mut tile_size: u16 = 100;
+    let mut anim_t = 0.0f32;
+    let mut glitch = GlitchState {
+        columns: Vec::new(),
+        frames_left: 0,
+    };
+    let mut face_det = FaceDetector::new();
+    let mut cache: Option<FrameCache> = None;
     let mut running = true;
 
     while running {
@@ -120,6 +166,26 @@ fn main() -> io::Result<()> {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Char('Q') => running = false,
                     KeyCode::Char('c') | KeyCode::Char('C') => color_mode = color_mode.next(),
+                    KeyCode::Char('b') | KeyCode::Char('B') => ramp_mode = ramp_mode.next(),
+                    KeyCode::Char('m') | KeyCode::Char('M') => mirror = !mirror,
+                    KeyCode::Char('p') | KeyCode::Char('P') => paused = !paused,
+                    KeyCode::Char('i') | KeyCode::Char('I') => invert_lum = !invert_lum,
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        if let Some(ref c) = cache {
+                            let _ = save_screenshot(c, color_mode, ramp_mode, tile_size, mirror, invert_lum);
+                        }
+                    }
+                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                        tile_size = (tile_size.saturating_add(10)).min(300);
+                    }
+                    KeyCode::Char('-') | KeyCode::Char('_') => {
+                        tile_size = tile_size.saturating_sub(10).max(4);
+                    }
+                    KeyCode::Char(d) if d.is_ascii_digit() => {
+                        if let Some(m) = ColorMode::from_digit(d as u8 - b'0') {
+                            color_mode = m;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -134,51 +200,121 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-        let mut frame = Mat::default();
-        if cap.read(&mut frame).unwrap_or(false) && !frame.empty() {
-            let mut small = Mat::default();
-            let _ = imgproc::resize(
-                &frame,
-                &mut small,
-                opencv::core::Size::new(ascii_w, ascii_h),
-                0.0,
-                0.0,
-                imgproc::INTER_AREA,
-            );
+        if !paused {
+            let mut frame = Mat::default();
+            if cap.read(&mut frame).unwrap_or(false) && !frame.empty() {
+                if mirror {
+                    let mut flipped = Mat::default();
+                    let _ = opencv::core::flip(&frame, &mut flipped, 1);
+                    frame = flipped;
+                }
 
-            let mut gray = Mat::default();
-            let _ = imgproc::cvt_color(
-                &small,
-                &mut gray,
-                imgproc::COLOR_BGR2GRAY,
-                0,
-                opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
-            );
+                let mut bgr = Mat::default();
+                let _ = imgproc::resize(
+                    &frame,
+                    &mut bgr,
+                    Size::new(ascii_w, ascii_h),
+                    0.0,
+                    0.0,
+                    imgproc::INTER_AREA,
+                );
 
-            rainbow_t += 0.015;
+                let mut gray = Mat::default();
+                let _ = imgproc::cvt_color(
+                    &bgr,
+                    &mut gray,
+                    imgproc::COLOR_BGR2GRAY,
+                    0,
+                    opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
+                );
 
-            stdout.queue(cursor::MoveTo(0, 0))?;
-            let ramp_len = ASCII_RAMP.len() as f32;
+                let edges = if ramp_mode == RampMode::Edge {
+                    compute_edges(&gray)
+                } else {
+                    None
+                };
+
+                face_det.update(&gray);
+
+                cache = Some(FrameCache { bgr, gray, edges });
+            }
+        }
+
+        if let Some(ref cached) = cache {
+            anim_t += 0.015;
+            glitch.tick(term_cols);
+
+            let mut stats = FrameStats::new();
+            let mut screen = String::with_capacity((ascii_w * ascii_h) as usize * 2);
 
             for y in 0..ascii_h {
                 for x in 0..ascii_w {
-                    let val = gray.at_2d::<u8>(y, x).unwrap_or(&0);
-                    let lum = *val as f32 / 255.0;
-                    let idx = ((lum * (ramp_len - 1.0)).round() as usize).min(ASCII_RAMP.len() - 1);
-                    let ch = ASCII_RAMP[idx] as char;
+                    let raw_lum = *cached.gray.at_2d::<u8>(y, x).unwrap_or(&0) as f32 / 255.0;
+                    let lum = if invert_lum { 1.0 - raw_lum } else { raw_lum };
+                    stats.record(lum);
 
-                    let color = color_mode.to_crossterm(x as u16, y as u16, rainbow_t);
-                    stdout.queue(SetForegroundColor(color))?;
-                    stdout.queue(Print(ch))?;
+                    let edge_mag = cached
+                        .edges
+                        .as_ref()
+                        .map(|m| edge_strength(m, x, y))
+                        .unwrap_or(0.0);
+
+                    let ch = char_for(lum, ramp_mode, x as u16, y as u16, edge_mag);
+
+                    let bgr_pixel = cached.bgr.at_2d::<opencv::core::Vec3b>(y, x).ok().map(|v| {
+                        (v[0], v[1], v[2])
+                    });
+
+                    let ctx = ColorCtx {
+                        x: x as u16,
+                        y: y as u16,
+                        lum,
+                        t: anim_t,
+                        cols: term_cols,
+                        rows: term_rows.saturating_sub(1),
+                        tile: tile_size,
+                        glitch_hit: glitch.hit(x as u16),
+                        in_face: face_det.contains(x, y),
+                        bgr: bgr_pixel,
+                    };
+
+                    let pair = color_at(color_mode, &ctx);
+
+                    if let Some(bg) = pair.bg {
+                        let (br, bgc, bb) = term_color_rgb(bg);
+                        let _ = write!(screen, "\x1b[48;2;{};{};{}m", br, bgc, bb);
+                    }
+                    let (fr, fg, fb) = term_color_rgb(pair.fg);
+                    let _ = write!(screen, "\x1b[38;2;{};{};{}m{}", fr, fg, fb, ch);
                 }
             }
 
+            stdout.queue(cursor::MoveTo(0, 0))?;
+            stdout.queue(Print(&screen))?;
             stdout.queue(ResetColor)?;
+
+            let status = format!(
+                " color:{} | dark:{} light:{} avg:{:.2} | ramp:{} tile:{} | {}{}{} | c:color b:ramp m:mirror p:pause i:invert s:shot +/-:tile 1-9:jump q:quit ",
+                color_mode.name(),
+                stats.dark,
+                stats.light,
+                stats.avg_lum(),
+                ramp_mode.name(),
+                tile_size,
+                if mirror { "MIRROR " } else { "" },
+                if paused { "PAUSED " } else { "" },
+                if invert_lum { "INV " } else { "" },
+            );
+
             stdout.queue(cursor::MoveTo(0, term_rows - 1))?;
-            stdout.queue(Print(format!(
-                " color: {} | c:cycle q:quit ",
-                color_mode.name()
-            )))?;
+            stdout.queue(SetForegroundColor(crossterm::style::Color::DarkGrey))?;
+            let status_show = if status.len() > term_cols as usize {
+                &status[..term_cols as usize]
+            } else {
+                &status
+            };
+            stdout.queue(Print(status_show))?;
+            stdout.queue(ResetColor)?;
             stdout.flush()?;
         }
 
@@ -192,5 +328,64 @@ fn main() -> io::Result<()> {
     stdout.queue(cursor::Show)?;
     stdout.flush()?;
     terminal::disable_raw_mode()?;
+    Ok(())
+}
+
+fn term_color_rgb(c: TermColor) -> (u8, u8, u8) {
+    match c {
+        TermColor::Rgb { r, g, b } => (r, g, b),
+        TermColor::Black => (0, 0, 0),
+        TermColor::White => (255, 255, 255),
+        TermColor::DarkGrey => (80, 80, 80),
+        TermColor::Grey => (128, 128, 128),
+        TermColor::Red => (255, 0, 0),
+        TermColor::Green => (0, 255, 0),
+        TermColor::Blue => (0, 0, 255),
+        TermColor::Yellow => (255, 255, 0),
+        TermColor::Cyan => (0, 255, 255),
+        TermColor::Magenta => (255, 0, 255),
+        _ => (200, 200, 200),
+    }
+}
+
+fn save_screenshot(
+    cache: &FrameCache,
+    color_mode: ColorMode,
+    ramp_mode: RampMode,
+    tile_size: u16,
+    mirror: bool,
+    invert_lum: bool,
+) -> io::Result<()> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let path = format!("asciitubing_{}.txt", ts);
+    let h = cache.gray.rows();
+    let w = cache.gray.cols();
+    let mut out = String::new();
+    for y in 0..h {
+        for x in 0..w {
+            let raw = *cache.gray.at_2d::<u8>(y, x).unwrap_or(&0) as f32 / 255.0;
+            let lum = if invert_lum { 1.0 - raw } else { raw };
+            let edge_mag = cache
+                .edges
+                .as_ref()
+                .map(|m| edge_strength(m, x, y))
+                .unwrap_or(0.0);
+            let ch = char_for(lum, ramp_mode, x as u16, y as u16, edge_mag);
+            out.push(ch);
+        }
+        out.push('\n');
+    }
+    let header = format!(
+        "# asciitubing capture\n# color:{} ramp:{} tile:{} mirror:{} invert:{}\n",
+        color_mode.name(),
+        ramp_mode.name(),
+        tile_size,
+        mirror,
+        invert_lum
+    );
+    std::fs::write(&path, format!("{header}{out}"))?;
     Ok(())
 }
